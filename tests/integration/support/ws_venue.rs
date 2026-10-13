@@ -63,13 +63,13 @@ impl WsVenue {
     ///
     /// `usize::MAX` keeps every connection open for the life of the test.
     pub async fn start(frames_before_close: usize) -> Self {
-        Self::start_with(frames_before_close, false, false).await
+        Self::start_with(frames_before_close, false, false, false).await
     }
 
     /// The same, but a `connect` arriving on a reconnected session is left
     /// unanswered until [`WsVenue::release_restoration`].
     pub async fn holding_restoration(frames_before_close: usize) -> Self {
-        Self::start_with(frames_before_close, true, false).await
+        Self::start_with(frames_before_close, true, false, false).await
     }
 
     /// A venue that accepts the socket and then refuses every restoration.
@@ -78,13 +78,21 @@ impl WsVenue {
     /// client that counts a successful write as a working session resets its
     /// attempt budget on every reconnect and retries forever.
     pub async fn refusing_restoration(frames_before_close: usize) -> Self {
-        Self::start_with(frames_before_close, false, true).await
+        Self::start_with(frames_before_close, false, true, false).await
+    }
+
+    /// A venue that echoes the `request-id` as a JSON **string** rather than a
+    /// number — the shape the venue has been observed to use, and the one the
+    /// acknowledgement decode has to tolerate.
+    pub async fn string_request_id(frames_before_close: usize) -> Self {
+        Self::start_with(frames_before_close, false, false, true).await
     }
 
     async fn start_with(
         frames_before_close: usize,
         hold_restoration: bool,
         refuse_restoration: bool,
+        string_request_id: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -173,7 +181,14 @@ impl WsVenue {
                     if let Some(id) = frame.get("request-id")
                         && let Some(object) = reply.as_object_mut()
                     {
-                        object.insert("request-id".to_string(), id.clone());
+                        // The venue may echo the id as a number or a string; the
+                        // string shape is what the decode has to tolerate.
+                        let echoed = if string_request_id {
+                            serde_json::Value::String(id.to_string())
+                        } else {
+                            id.clone()
+                        };
+                        object.insert("request-id".to_string(), echoed);
                     }
                     let reply = reply.to_string();
 

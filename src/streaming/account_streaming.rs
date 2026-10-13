@@ -224,6 +224,32 @@ impl std::fmt::Display for RawPayload {
     }
 }
 
+/// Deserialize a `request-id` the venue may send as a JSON number **or** a
+/// numeric string, and that may be absent.
+///
+/// The venue may echo `request-id` as a *string*. A plain `Option<u64>` rejects
+/// that, which fails the whole status frame and loses the acknowledgement — the
+/// connect then times out with nothing to show for it. A value that is neither a
+/// number nor a parseable string becomes `None`, so the frame still settles by
+/// `action` rather than being dropped.
+fn de_request_id<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Number(u64),
+        Text(String),
+    }
+
+    match Option::<Id>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Id::Number(id)) => Ok(Some(id)),
+        Some(Id::Text(text)) => Ok(text.trim().parse::<u64>().ok()),
+    }
+}
+
 /// Represents a status message received from the API.
 ///
 /// This struct is used to deserialize status messages, which provide information
@@ -260,7 +286,10 @@ pub struct StatusMessage {
     /// so it never came back — and a required `u64` here meant every status
     /// frame failed to deserialize, fell through the untagged enum, and was
     /// dropped with a warning. Acknowledgements were invisible.
-    #[serde(default)]
+    ///
+    /// Deserialized tolerantly (number or numeric string): the venue may echo it
+    /// as a string, which a plain `u64` rejects.
+    #[serde(default, deserialize_with = "de_request_id")]
     pub request_id: Option<u64>,
     /// What the action applied to, echoed back. `connect` returns the account
     /// numbers it subscribed.
@@ -287,7 +316,7 @@ pub struct ErrorMessage {
     /// `Option` because the documented example of a refusal does not show one.
     /// When it is absent the refusal is matched to the oldest action in flight
     /// with the same `action`, which is why that field is not optional.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_request_id")]
     pub request_id: Option<u64>,
     /// A human-readable description of the error.
     ///
@@ -1636,6 +1665,23 @@ mod acknowledgement_tests {
                 .is_err(),
             "the other action is still in flight"
         );
+    }
+
+    /// The venue may echo `request-id` as a string; the frame must still settle
+    /// the action it names instead of being dropped as unshaped.
+    #[tokio::test]
+    async fn a_string_request_id_still_settles_its_action() {
+        let mut pending = HashMap::new();
+        let (connect, connected) = waiting(SubRequestAction::Connect);
+        pending.insert(4, connect);
+
+        settle(
+            &mut pending,
+            &frame(r#"{"status":"ok","action":"connect","request-id":"4"}"#),
+        );
+
+        assert!(connected.await.expect("answered").is_ok());
+        assert!(pending.is_empty());
     }
 
     /// The defect this exists for: a refused `connect` used to return `Ok` and

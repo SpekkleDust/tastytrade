@@ -241,3 +241,26 @@ async fn a_first_connection_subscribes_to_nothing_on_its_own() {
     );
     assert!(matches!(streamer.state().await, ConnectionState::Connected));
 }
+
+/// The venue may echo `request-id` as a JSON **string**. A `subscribe_to_account`
+/// must still resolve on that acknowledgement rather than time out with the
+/// action silently unanswered.
+#[tokio::test]
+async fn a_string_request_id_is_still_an_acknowledgement() {
+    let rest = rest_venue().await;
+    let ws = WsVenue::string_request_id(usize::MAX).await;
+    let config = config_for(&rest, &ws);
+
+    let tasty = TastyTrade::connect(&config)
+        .await
+        .expect("authentication must succeed");
+    let accounts = tasty.accounts().await.expect("one account");
+    let streamer = AccountStreamer::connect_with_policy(&tasty, quick_policy())
+        .await
+        .expect("the loopback venue accepts the connection");
+
+    streamer
+        .subscribe_to_account(&accounts[0])
+        .await
+        .expect("a string request-id is still an acknowledgement");
+}
