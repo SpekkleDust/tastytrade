@@ -863,16 +863,43 @@ fn settle(pending: &mut HashMap<u64, PendingAction>, event: &AccountEvent) -> Op
     Some((id, accepted))
 }
 
+/// A suffix naming an unreadable acknowledgement the venue sent for `action`,
+/// when one was seen this session.
+///
+/// An unshapeable status frame is kept as an `Unknown` event rather than failing
+/// the action — it may be a heartbeat, or a frame this client simply cannot
+/// place — so without this the caller sees only a timeout while the venue's
+/// answer sat in a `warn!` line. Naming it here is what makes "the venue
+/// answered and we could not read it" distinguishable from "the venue never
+/// answered".
+fn unreadable_note(unreadable: &HashMap<String, usize>, action: &SubRequestAction) -> String {
+    match unreadable.get(&action.to_string()) {
+        Some(bytes) => format!(
+            " (the venue sent a frame for {action} this client could not read: {bytes} bytes)"
+        ),
+        None => String::new(),
+    }
+}
+
 /// Fails every action still waiting, with `reason`.
 ///
 /// A session that ends takes its in-flight actions with it: the frame is gone
 /// with the socket, and a caller must not be left awaiting an answer that can
-/// no longer come.
-fn abandon(pending: &mut HashMap<u64, PendingAction>, reason: &str) {
+/// no longer come. `unreadable` annotates an action whose acknowledgement
+/// arrived but could not be shaped, so the reason does not read as "never
+/// answered".
+fn abandon(
+    pending: &mut HashMap<u64, PendingAction>,
+    unreadable: &HashMap<String, usize>,
+    reason: &str,
+) {
     for (_, waiting) in pending.drain() {
         report(
             waiting.ack,
-            Err(TastyTradeError::Streaming(reason.to_string())),
+            Err(TastyTradeError::Streaming(format!(
+                "{reason}{}",
+                unreadable_note(unreadable, &waiting.action)
+            ))),
         );
     }
 }
@@ -906,6 +933,11 @@ async fn run_session(
     // Actions written and not yet answered. Per session on purpose: the socket
     // that carried them is what would have brought the answer back.
     let mut pending: HashMap<u64, PendingAction> = HashMap::new();
+    // Acknowledgements the venue sent that this client could not shape, keyed by
+    // the action they name and holding the frame's byte length. Kept so a later
+    // timeout or abandon can say the venue *did* answer, rather than leaving the
+    // caller with a bare timeout.
+    let mut unreadable: HashMap<String, usize> = HashMap::new();
     let mut next_request_id: u64 = 1;
     // The ids are assigned here rather than by `send`, because correlation is
     // entirely between this loop and the venue — a caller never sees one.
@@ -994,8 +1026,9 @@ async fn run_session(
                             // is.
                             warn!("The venue did not answer a {} within {ACTION_TIMEOUT:?}", waiting.action);
                             report(waiting.ack, Err(TastyTradeError::Streaming(format!(
-                                "the venue did not acknowledge the {} within {ACTION_TIMEOUT:?}",
-                                waiting.action
+                                "the venue did not acknowledge the {} within {ACTION_TIMEOUT:?}{}",
+                                waiting.action,
+                                unreadable_note(&unreadable, &waiting.action),
                             ))));
                         }
                         restoration_expired |= restoring.remove(&id);
@@ -1071,6 +1104,18 @@ async fn run_session(
                     let Some(event) = decode_account_frame(&data) else {
                         continue;
                     };
+
+                    // An acknowledgement the venue sent that did not fit its
+                    // model. Never fails the action here — it may be a heartbeat,
+                    // or a frame this client simply cannot place — but it is
+                    // remembered so a later timeout can name it instead of
+                    // reading as "the venue never answered".
+                    if let AccountEvent::Unknown(unknown) = &event
+                        && unknown.kind.is_none()
+                        && let Some(action) = &unknown.action
+                    {
+                        unreadable.insert(action.clone(), unknown.payload.len());
+                    }
 
                     // Resolved first, then delivered. A caller awaiting the action
                     // and a caller reading the stream are usually the same task, so
@@ -1175,6 +1220,7 @@ async fn run_session(
 
     abandon(
         &mut pending,
+        &unreadable,
         "the account stream ended before the venue answered",
     );
 
@@ -1684,6 +1730,54 @@ mod acknowledgement_tests {
         assert!(pending.is_empty());
     }
 
+    /// An acknowledgement the client could not shape must not read as the venue
+    /// never answering: the abandon reason names the unreadable frame.
+    #[tokio::test]
+    async fn an_unreadable_acknowledgement_is_named_when_an_action_is_abandoned() {
+        let mut pending = HashMap::new();
+        let (connect, connected) = waiting(SubRequestAction::Connect);
+        pending.insert(1, connect);
+
+        let mut unreadable = HashMap::new();
+        unreadable.insert("connect".to_string(), 130usize);
+
+        abandon(
+            &mut pending,
+            &unreadable,
+            "the account stream ended before the venue answered",
+        );
+
+        let error = connected
+            .await
+            .expect("answered")
+            .expect_err("abandoned, not answered");
+        let text = format!("{error}");
+        assert!(text.contains("could not read"), "{text}");
+        assert!(text.contains("130 bytes"), "{text}");
+    }
+
+    /// With nothing unreadable, the reason is exactly the one given.
+    #[tokio::test]
+    async fn a_plain_abandon_keeps_its_reason() {
+        let mut pending = HashMap::new();
+        let (connect, connected) = waiting(SubRequestAction::Connect);
+        pending.insert(1, connect);
+
+        abandon(
+            &mut pending,
+            &HashMap::new(),
+            "the account stream ended before the venue answered",
+        );
+
+        let error = connected.await.expect("answered").expect_err("abandoned");
+        let text = format!("{error}");
+        assert!(
+            text.contains("the account stream ended before the venue answered"),
+            "{text}"
+        );
+        assert!(!text.contains("could not read"), "{text}");
+    }
+
     /// The defect this exists for: a refused `connect` used to return `Ok` and
     /// be recorded for every future reconnect.
     #[tokio::test]
@@ -1822,7 +1916,7 @@ mod acknowledgement_tests {
         let (connect, connected) = waiting(SubRequestAction::Connect);
         pending.insert(1, connect);
 
-        abandon(&mut pending, "the account stream dropped");
+        abandon(&mut pending, &HashMap::new(), "the account stream dropped");
 
         let error = connected
             .await
