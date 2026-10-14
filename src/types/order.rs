@@ -473,24 +473,71 @@ pub struct OrderFill {
 /// This struct encapsulates the details of an order, including its time-in-force,
 /// order type, price, price effect, and a vector of order legs.  It uses the
 /// `derive_builder` crate to provide a convenient builder pattern for constructing
-/// order instances.  The `serde` attributes control how the struct is serialized
-/// and deserialized, ensuring compatibility with external APIs or data formats.
-#[derive(Builder, Serialize, Debug, Clone)]
-#[serde(rename_all = "kebab-case")]
+/// order instances.  Its `Serialize` impl is hand-written so the body matches
+/// what the venue accepts for each order type.
+#[derive(Builder, Debug, Clone)]
 #[builder(setter(into), build_fn(validate = "OrderBuilder::validate_order"))]
 pub struct Order {
     /// Specifies how long the order remains active before being canceled or expiring.
     time_in_force: TimeInForce,
     /// The type of order (e.g., Limit, Market, Stop).
     order_type: OrderType,
-    /// The price of the order.  Serialized with arbitrary precision.
-    #[serde(with = "rust_decimal::serde::arbitrary_precision")]
+    /// The price of the order.
+    ///
+    /// A limit or stop-limit order must carry a working price; a market order
+    /// must not carry one at all. The builder enforces both, and the `Serialize`
+    /// impl drops this field from the wire for a market order.
     price: Decimal,
     /// The effect of the price on the account (Debit, Credit, None).
+    ///
+    /// Travels with `price`, and is dropped with it for a market order.
     price_effect: PriceEffect,
     /// A vector of order legs, each specifying details about a specific instrument
     /// involved in the order.
     legs: Vec<OrderLeg>,
+}
+
+impl Serialize for Order {
+    /// Serializes the request body the venue accepts.
+    ///
+    /// A market order carries neither `price` nor `price-effect`: the venue's
+    /// own market example omits both, and sending them turns a single-leg
+    /// market order into an HTTP 400. Every other order type keeps both, in the
+    /// arbitrary-precision number form the order bodies already used.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let takes_price = !matches!(self.order_type, OrderType::Market);
+        OrderBody {
+            time_in_force: self.time_in_force,
+            order_type: self.order_type,
+            price: takes_price.then_some(self.price),
+            price_effect: takes_price.then_some(self.price_effect),
+            legs: &self.legs,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// The [`Order`] request body as it goes out on the wire.
+///
+/// Split out from `Order` so `price` and `price-effect` can be omitted together
+/// for a market order. Serde's per-field `skip_serializing_if` cannot make that
+/// call: the predicate only sees its own field, never `order_type`.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct OrderBody<'a> {
+    time_in_force: TimeInForce,
+    order_type: OrderType,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::types::wire::decimal_option"
+    )]
+    price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_effect: Option<PriceEffect>,
+    legs: &'a [OrderLeg],
 }
 
 /// Represents a leg of an order.
@@ -577,11 +624,19 @@ pub struct DryRunRecord {
     pub size: Decimal,
     /// The underlying symbol for the dry-run order.
     pub underlying_symbol: Symbol,
-    /// The price of the dry-run order.  Uses arbitrary precision deserialization.
-    #[serde(with = "rust_decimal::serde::arbitrary_precision")]
-    pub price: Decimal,
+    /// The price of the dry-run order, for order types that have one.
+    ///
+    /// `Option` for the same reason as [`LiveOrderRecord::price`]: a market
+    /// order carries no price, and the venue's dry-run echo omits the field.
+    /// A required `Decimal` here meant the dry-run of a market order could not
+    /// be decoded — the request went out fine and the answer was thrown away.
+    #[serde(default, with = "crate::types::wire::decimal_option")]
+    pub price: Option<Decimal>,
     /// The effect of the dry-run order's price on the account (Debit, Credit, None).
-    pub price_effect: PriceEffect,
+    ///
+    /// Absent with `price`.
+    #[serde(default)]
+    pub price_effect: Option<PriceEffect>,
     /// The status of the dry-run order (e.g., Received, Filled, Cancelled).
     pub status: OrderStatus,
     /// Indicates whether the dry-run order can be cancelled.
@@ -860,6 +915,88 @@ mod tests {
         assert!(serialized.contains("Limit"));
         assert!(serialized.contains("150.50"));
         assert!(serialized.contains("Debit"));
+    }
+
+    /// A market order must go out without `price` or `price-effect`: the venue
+    /// rejects a market order that carries them (upstream issue #155), and its
+    /// own market example omits both.
+    #[test]
+    fn a_market_order_omits_price_and_price_effect() {
+        let leg = OrderLegBuilder::default()
+            .instrument_type(InstrumentType::Equity)
+            .symbol("F")
+            .quantity(Decimal::ONE)
+            .action(Action::Buy)
+            .build()
+            .unwrap();
+
+        let order = OrderBuilder::default()
+            .time_in_force(TimeInForce::Day)
+            .order_type(OrderType::Market)
+            .price(Decimal::ZERO)
+            .price_effect(PriceEffect::None)
+            .legs(vec![leg])
+            .build()
+            .expect("a market order with no price builds");
+
+        let body = serde_json::to_value(&order).expect("the order must serialize");
+        assert_eq!(body["order-type"], "Market");
+        assert!(body.get("price").is_none(), "{body}");
+        assert!(body.get("price-effect").is_none(), "{body}");
+        assert!(body.get("legs").is_some(), "{body}");
+    }
+
+    /// The limit body is unchanged: it still carries `price` and `price-effect`
+    /// under their kebab-case names.
+    #[test]
+    fn a_limit_order_still_carries_price_and_price_effect() {
+        let leg = OrderLegBuilder::default()
+            .instrument_type(InstrumentType::Equity)
+            .symbol("AAPL")
+            .quantity(Decimal::from(1))
+            .action(Action::BuyToOpen)
+            .build()
+            .unwrap();
+
+        let order = OrderBuilder::default()
+            .time_in_force(TimeInForce::Day)
+            .order_type(OrderType::Limit)
+            .price(Decimal::from_str("1.25").unwrap())
+            .price_effect(PriceEffect::Debit)
+            .legs(vec![leg])
+            .build()
+            .unwrap();
+
+        let body = serde_json::to_value(&order).expect("the order must serialize");
+        assert!(body.get("price").is_some(), "{body}");
+        assert_eq!(body["price-effect"], "Debit");
+    }
+
+    /// The venue's dry-run echo of a market order omits `price` and
+    /// `price-effect`, so the record must decode without them. A required
+    /// `price` here threw the whole dry-run answer away for the one order type
+    /// this crate could not previously send.
+    #[test]
+    fn a_market_dry_run_echo_decodes_without_price() {
+        let body = r#"{
+            "account-number": "5WZ55830",
+            "time-in-force": "Day",
+            "order-type": "Market",
+            "size": "1",
+            "underlying-symbol": "F",
+            "status": "Received",
+            "cancellable": true,
+            "editable": true,
+            "edited": false,
+            "legs": []
+        }"#;
+
+        let record: DryRunRecord =
+            serde_json::from_str(body).expect("a market echo carries no price");
+
+        assert_eq!(record.order_type, OrderType::Market);
+        assert!(record.price.is_none(), "{record:?}");
+        assert!(record.price_effect.is_none(), "{record:?}");
     }
 
     #[test]
